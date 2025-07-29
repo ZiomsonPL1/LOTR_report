@@ -1,0 +1,407 @@
+---
+title: "Wizualizacja informacji dotyczących Władcy Pierścieni"
+author: "ziomsonpl"
+date: "2025-07-28"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(dplyr)
+library(ggplot2)
+library(tidygraph)
+library(ggraph)
+library(stringr)
+library(visNetwork)
+library(fuzzyjoin)
+library(plotly)
+library(wordcloud2)
+library(tidytext)
+library(htmltools)
+```
+<style> .flex-row { display: flex; justify-content: space-between; gap: 2%; margin-bottom: 2em; } .column { width: 49%; } .bottom-section { margin-top: 2em; } </style>
+
+```{r}
+
+LOTR_characters <- read.csv("C:/Users/Paawel/Desktop/TheLordOfTheRings/lotr_characters.csv")
+LOTR_scripts <- read.csv("C:/Users/Paawel/Desktop/TheLordOfTheRings/lotr_scripts.csv")
+
+
+LOTR_characters <- LOTR_characters %>% arrange(name)
+LOTR_scripts <- LOTR_scripts %>% arrange(char)
+
+LOTR_characters_liczba_postaci <- LOTR_characters %>% 
+  group_by(race, gender) %>% 
+  summarise(liczba_postaci = n()) %>%
+  mutate(gender = str_replace(gender, "Most likely male", "Male"),
+         gender = str_replace(gender, "Males", "Male"),
+         gender = str_to_upper(gender)) %>%
+  filter(race != "", gender != "")
+
+plot1 <- ggplot(LOTR_characters_liczba_postaci, aes(x = race, y = liczba_postaci, color = gender)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(title = "Liczba postaci ze względu na rasę i płeć",
+       x = "Rasa",
+       y = "Liczba") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 7)) +
+  scale_y_continuous(limits = c(0, 350), breaks = seq(0, 350, 25))
+
+```
+
+## 1. Wykresy
+<div class="flex-row"> <div class="column">
+**Wykres 1**: Liczba postaci z podziałem na rasę i płeć
+
+```{r}
+plot1
+```
+</div> <div class="column">
+**Wykres 2**: Liczba słów w poszczególnych filmach
+
+```{r}
+LOTR_characters1 <- LOTR_characters %>%
+  mutate(across(c(gender, race, birth, death), ~ str_trim(.) %>% na_if(""))) %>%
+  filter(if_any(c(gender, race, birth, death), ~ !is.na(.))) %>%
+  na.omit() %>% mutate(name = str_to_lower(name))
+
+LOTR_scripts1 <- LOTR_scripts %>%mutate(name = str_to_lower(char))
+
+
+fuzzy_merge <- stringdist_inner_join(LOTR_characters1, LOTR_scripts1,
+                                     by = "name",
+                                     method = "jw",
+                                     max_dist = 0.1)
+fuzzy_merge <- fuzzy_merge %>%
+  filter(!(char == "ARAGORN" & (race == "Elves" | spouse == "None" | name.x == "aravorn") |
+           (char == "DENETHOR" & spouse == "Unnamed wife") |
+           char == "DAMROD" | char == "ARGORN")) %>%
+  mutate(imie = str_replace_all(char, "[^A-Z]", "")) %>%
+  mutate(imie = case_when(
+    imie == "GALADRIL" ~ "GALADRIEL",
+    TRUE ~ imie
+  ))
+
+fuzzy_merge_dialouges <- fuzzy_merge %>%
+  group_by(imie) %>% summarise(liczba_dialogow = n())
+
+fuzzy_merge <- fuzzy_merge %>% mutate(liczba_słów = str_count(dialog, "\\S+"),
+                                      movie = str_trim(movie)) #SARUMAN
+
+plot2 <- fuzzy_merge %>%
+  group_by(movie) %>% 
+  summarise(liczba_słów_w_filmie = sum(liczba_słów)) %>%
+  arrange(liczba_słów_w_filmie) %>%
+  mutate(movie = factor(movie, levels = movie)) %>%
+  ggplot(aes(x = movie, y = liczba_słów_w_filmie)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "navy", color = "skyblue") + 
+  labs(title = "Liczba słów w każdym filmie",
+       x = "Tutuł filmu",
+       y = "Liczba słów") +
+  theme_minimal()
+plot2  
+```
+</div> </div> <div class="bottom-section"> **Wykres 3:** Liczba dialogów postaci w filmach trylogii
+
+
+```{r}
+kolejnosc_filmow = c("The Fellowship of the Ring", "The Two Towers", "The Return of the King")
+
+plot3 <- fuzzy_merge %>%
+  group_by(movie, imie) %>%
+  summarise(liczba_dialogów_w_filmie = n()) %>%
+  ungroup() %>%
+  mutate(movie = factor(movie, levels = kolejnosc_filmow)) %>%
+  ggplot(aes(x = movie, y = liczba_dialogów_w_filmie, group = imie, color = imie, text = paste0("Imię: ", imie, "<br>Liczba dialogów: ", liczba_dialogów_w_filmie))) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Liczba dialogów wypowiedzianych przez postacie",
+       x = "Film",
+       y = "Liczba dialogów") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 6, angle = 45, vjust = 0.5)
+  )
+ggplotly(plot3, tooltip = "text")
+```
+
+
+
+## 2. Grafy relacyjne
+
+<style>
+.flex-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 2%;
+  margin-bottom: 2em;
+}
+.column {
+  width: 49%;
+}
+</style>
+
+<div class="flex-row">
+
+<div class="column">
+
+**Graf 1**: Relacje małżeńskie
+
+```{r pressure, echo=FALSE}
+spouse_edges <- LOTR_characters %>% 
+  filter(!str_detect(spouse, regex("unknown|none|unnamed|^$|loved", ignore_case = TRUE))) %>%
+  select(from = name, to = spouse)
+
+nodes <- spouse_edges %>%
+  select(label = from) %>%
+  bind_rows(spouse_edges %>% select(label = to)) %>%
+  distinct() %>%
+  mutate(id = row_number()) %>%
+  distinct(id, .keep_all = TRUE)
+
+edges <- spouse_edges %>%
+  left_join(nodes, by = c("from" = "label")) %>%
+  rename(from_id = id) %>%
+  left_join(nodes, by = c("to" = "label")) %>%
+  rename(to_id = id) %>%
+  select(from = from_id, to = to_id) %>%
+  filter(!is.na(from), !is.na(to))
+
+nodes <- nodes %>% mutate(title = label)
+
+visNetwork(nodes, edges, main = "Relacje małżeńskie", background = "#EEDBBD") %>%
+  visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE) %>%
+  visLayout(randomSeed = 123) %>%
+  visPhysics(stabilization = TRUE) %>%
+  visInteraction(hover = TRUE) %>%
+  visNodes(shape = "dot", size = 15, color = list(background = "purple", border = "#835581", highlight = "#E03A42", hover = "#F77964"))
+
+```
+</div> <div class="column">
+
+**Graf 2**: Pochodzenie postaci
+
+```{r}
+realm_edges <- LOTR_characters %>%
+  filter(realm != "") %>%
+  select(from = realm, to = name, race)
+
+nodes1 <- realm_edges %>%
+  select(label = from) %>%
+  bind_rows(realm_edges %>% select(label = to)) %>%
+  distinct() %>%
+  mutate(id = row_number())
+
+edges1 <- realm_edges %>%
+  left_join(nodes1, by = c("from" = "label")) %>%
+  rename(from_id = id) %>%
+  left_join(nodes1, by = c("to" = "label")) %>%
+  rename(to_id = id) %>%
+  select(from = from_id, to = to_id)
+
+nodes1 <- nodes1 %>% 
+  left_join(realm_edges %>% select(label = to, race), by = "label") %>%
+  mutate(
+    typ = case_when(id <= 75 ~ "realm",
+                    id > 75 ~ "char"),
+    title = ifelse(typ == "char",
+                   paste0("<b>", label, "</b><br>Rasa: ", race),
+                   label),
+    group = typ
+  )
+
+visNetwork(nodes1, edges1, main = "Pochodzenie postaci", background = "lightyellow") %>%
+  visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE) %>%
+  visLayout(randomSeed = 123) %>%
+  visPhysics(stabilization = TRUE) %>%
+  visInteraction(hover = TRUE) %>%
+  visNodes(shape = "dot", size = 15, shadow = TRUE, color = list(hover = "yellow", highlight = "red")) %>%
+  visEdges(smooth = list(enabled = TRUE, type = "curvedCW")) %>%
+  visGroups(
+    groupname = "realm",
+    color = list(background = "brown", border = "darkred")
+  ) %>%
+  visGroups(groupname = "char",
+            color = list(background = "orange", border = "darkorange")) %>%
+  visLegend(addNodes = list(
+    list(label = "Królestwo", shape = "dot", color = "brown"),
+    list(label = "Postać", shape = "dot", color = "orange")
+  ),
+  useGroups = FALSE,
+  width = 0.1,
+  position = "right")
+```
+</div> </div> 
+**Graf 3**: Powiązania ras, postaci i filmów
+
+```{r}
+fuzzy_merge_graph <- fuzzy_merge %>%
+  select(from = race, to = imie, to_to = movie)
+
+nodes2 <- fuzzy_merge_graph %>%
+  select(label = from) %>%
+  bind_rows(fuzzy_merge_graph %>% select(label = to)) %>%
+  bind_rows(fuzzy_merge_graph %>% select(label = to_to)) %>%
+  distinct() %>%
+  mutate(id = row_number())
+
+edges2 <- fuzzy_merge_graph %>%
+  left_join(nodes2, by = c("from" = "label")) %>%
+  rename(from_id = id) %>%
+  left_join(nodes2, by = c("to" = "label")) %>%
+  rename(to_id = id) %>%
+  left_join(nodes2, by = c("to_to" = "label")) %>%
+  rename(to_to_id = id)
+
+edges_race_to_char <- edges2 %>%
+  select(from = from_id, to = to_id)
+
+edges_char_to_movie <- edges2 %>%
+  select(from = to_id, to = to_to_id)
+
+edges_final <- bind_rows(edges_race_to_char, edges_char_to_movie) %>%
+  distinct()
+
+nodes2 <- nodes2 %>%
+  mutate(group = case_when(
+    label %in% fuzzy_merge_graph$from ~ "race",
+    label %in% fuzzy_merge_graph$to ~ "character", 
+    label %in% fuzzy_merge_graph$to_to ~ "movie"
+  ))
+
+visNetwork(nodes2, edges_final, main = "Rasa i filmy postaci", background = "beige") %>%
+  visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE) %>%
+  visLayout(randomSeed = 123) %>%
+  visInteraction(hover = TRUE) %>%
+  visPhysics(stabilization = TRUE) %>%
+  visNodes(shape = "dot", size = 15, color = list(highlight = "yellow", hover = "#EEEE00")) %>%
+  visGroups(
+    groupname = "character",
+    color = list(background = "orange", border = "darkorange") 
+  ) %>%
+  visGroups(
+    groupname = "race",
+    color = list(background = "#FF7F24", border = "#8B4513")
+  ) %>%
+  visGroups(
+    groupname = "movie",
+    color = list(background = "#FF4040", border = "#8B2323")
+  ) %>%
+  visLegend(addNodes = list(
+    list(label = "Film", shape = "dot", color = "#FF4040"),
+    list(label = "Rasa", shape = "dot", color = "#FF7F24"),
+    list(label = "Postać", shape = "dot", color = "orange")
+  ),
+  useGroups = FALSE,
+  width = 0.1,
+  position = "right")
+```
+
+## 3. Wordcloudy
+
+```{r}
+fuzzy_merge_wordcloud <- fuzzy_merge %>%
+  group_by(imie) %>% summarise(dialog = str_c(dialog, collapse = " "))
+
+fuzzy_merge_wordcloud <- fuzzy_merge_wordcloud %>%
+  mutate(dialog = str_to_lower(dialog),
+         dialog = str_replace_all(dialog, "[^a-z ]", " "),
+         dialog = str_squish(dialog))
+
+gandalf_words <- fuzzy_merge_wordcloud %>%
+  filter(imie == "GANDALF") %>%
+  unnest_tokens(word, dialog) %>%
+  anti_join(stop_words, by = "word") %>%
+  count(word, sort = TRUE)
+
+
+aragorn_words <- fuzzy_merge_wordcloud %>%
+  filter(imie == "ARAGORN") %>%
+  unnest_tokens(word, dialog) %>%
+  anti_join(stop_words, by = "word") %>%
+  count(word, sort = TRUE)
+
+gimli_words <- fuzzy_merge_wordcloud %>%
+  filter(imie == "GIMLI") %>%
+  unnest_tokens(word, dialog) %>%
+  anti_join(stop_words, by = "word") %>%
+  count(word, sort = TRUE)
+
+elrond_words <- fuzzy_merge_wordcloud %>%
+  filter(imie == "ELROND") %>%
+  unnest_tokens(word, dialog) %>%
+  anti_join(stop_words, by = "word") %>%
+  count(word, sort = TRUE)
+
+saruman_words <- fuzzy_merge_wordcloud %>%
+  filter(imie == "SARUMAN") %>%
+  unnest_tokens(word, dialog) %>%
+  anti_join(stop_words, by = "word") %>%
+  count(word, sort = TRUE)
+
+gollum_words <- fuzzy_merge_wordcloud %>%
+  filter(imie == "GOLLUM") %>%
+  unnest_tokens(word, dialog) %>%
+  anti_join(stop_words, by = "word") %>%
+  count(word, sort = TRUE)
+```
+
+
+**Wordcloud 1:** Gandalf
+```{r wordcloud_grid, results='asis', echo=FALSE}
+
+wordcloud2(gandalf_words, size = 1)
+
+```
+
+## 4 Charakter wypowiedzi
+```{r}
+bing_sentiments <- get_sentiments("bing")
+
+sentimenatals <- fuzzy_merge %>%
+  mutate(dialog = str_to_lower(dialog),
+         dialog = str_replace_all(dialog, "[^a-z ]", " "),
+         dialog = str_squish(dialog)) %>%
+  filter(imie %in% c("GANDALF", "ARAGORN", "ARWEN", "ELROND", "GIMLI", "GOLLUM", "SARUMAN", "THEODEN", "EOWYN")) %>%
+  select(imie, movie, dialog) %>%
+  group_by(imie, movie) %>%
+  summarise(dialog = str_c(dialog, collapse = " "), .groups = "drop") %>%
+  unnest_tokens(word, dialog) %>%
+  inner_join(bing_sentiments, by = "word") %>%
+  group_by(imie, movie, sentiment) %>%
+  summarise(liczba_slow = n(), .groups = "drop") %>%
+  mutate(movie = factor(movie, levels = kolejnosc_filmow),
+         movie = recode(movie,
+                        "The Fellowship of the Ring" = "TFotR",
+                        "The Two Towers" = "TTT",
+                        "The Return of the King" = "TRotK"))
+
+plot4 <- ggplot(sentimenatals, 
+                aes(x = movie,
+                    y = liczba_slow,
+                    color = sentiment,
+                    group = sentiment,
+                    text = paste0("Liczba słów: ", liczba_slow))) +
+  geom_line() +
+  geom_point() +
+  scale_color_manual(name = "Charakter wypowiedzi",
+                     values = c("positive" = "lightgreen", negative = "darkred")) +
+  facet_wrap(~ imie, scales = "free_y") +
+  labs(title = "Zmiana charakteru wypowiedzi bohaterów",
+       x = "Film",
+       y = "liczba słów",
+       color = "Charakter wypowiedzi") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5))
+
+
+
+ggplotly(plot4, tooltip = "text")
+```
+
+
